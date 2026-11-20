@@ -597,8 +597,20 @@ def visualize_result(result: dict):
                    interpolation="bilinear")
     ax.contourf(x_arr, y_arr, sdf.T, levels=[-100, 0],
                 colors=["black"], alpha=0.4)
+    # Iso-time contours (1 s apart, labelled every 5 s): they bend around walls,
+    # which makes the effect of obstacles on TTR visible.
+    ttr_ma = np.ma.masked_invalid(ttr_vis.T)
+    t_max  = float(np.nanmax(ttr_vis))
+    if t_max > 1:
+        ax.contour(x_arr, y_arr, ttr_ma, levels=np.arange(1, t_max, 1),
+                   colors="white", linewidths=0.5, alpha=0.7)
+        major = np.arange(5, t_max, 5)
+        if major.size:
+            cs = ax.contour(x_arr, y_arr, ttr_ma, levels=major,
+                            colors="white", linewidths=1.1)
+            ax.clabel(cs, fmt="%d s", fontsize=7)
     for (p1, p2) in lines:
-        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "w-", lw=2)
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "-", color="cyan", lw=2.5)
     fig.colorbar(im, ax=ax, label="TTR (s)", shrink=0.85)
     _draw_goal_rect(ax, bbox)
     ax.set_aspect("equal"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
