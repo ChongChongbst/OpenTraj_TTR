@@ -2,9 +2,10 @@
 time to reach pipeline - scene goal picker + TTR computation
 ======================================================================
 Run:
-    python ttr_pipeline.py                      # pick goal on ETH-Univ
-    python ttr_pipeline.py --scene UCY-Zara1
-    python ttr_pipeline.py --scene ETH-Hotel --backend odp  (needs optimized_dp: https://github.com/SFU-MARS/optimized_dp/tree/master)
+    python time_to_reach.py                      # pick goal on ETH-Univ
+    python time_to_reach.py --scene UCY-Zara1
+    python time_to_reach.py --scene ETH-Hotel --backend odp  (needs optimized_dp: https://github.com/SFU-MARS/optimized_dp/tree/master)
+    python time_to_reach.py --goal 5 5 7 6       # headless: goal rectangle XMIN YMIN XMAX YMAX in metres
 
 Workflow:
     1. A window opens showing the scene photo, the pedestrian trajectories, and obstacle walls.
@@ -13,7 +14,11 @@ Workflow:
         Second click -> place the opposite corner of the goal; the goal region is now defined
         Right click -> clear and start over
       Two sliders below let you fine tune the half width and half height of the goal region (world meters).
-    3. Close the window: TTR is computed immediately for that rectangle.
+    3. Press the "Compute TTR" button: TTR is computed and saved as
+       output/<scene>-ttr-<n>.npz/.png. The picker stays open — pick another goal
+       and press it again as often as you like. Press "Quit" when done.
+    Without a display, the picker is served in the browser (WebAgg) at the URL
+    printed in the terminal (VS Code Remote-SSH forwards the port automatically).
     .
     .
     .
@@ -21,8 +26,34 @@ Workflow:
 '''
 import argparse, xml.etree.ElementTree as ET
 import numpy as np
+import os
 import matplotlib
-matplotlib.use("TkAgg")           # interactive backend — change to Qt5Agg if needed
+# Pick how the interactive goal picker is shown:
+#   "window"  — a desktop window (needs $DISPLAY, e.g. local session or ssh -X)
+#   "browser" — matplotlib WebAgg: served at http://127.0.0.1:<port> and opened
+#               in a web browser (works over VS Code Remote-SSH, which forwards
+#               the port automatically)
+#   None      — no interactive picker possible; --goal must be given
+UI_MODE = None
+if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    for _backend in ("TkAgg", "Qt5Agg", "GTK3Agg", "WXAgg"):
+        try:
+            matplotlib.use(_backend, force=True)
+            import matplotlib.pyplot as _test_plt
+            _test_plt.figure(); _test_plt.close()
+            UI_MODE = "window"
+            break
+        except Exception:
+            continue
+if UI_MODE is None:
+    try:
+        import tornado  # noqa: F401  (required by the WebAgg backend)
+        matplotlib.use("WebAgg", force=True)
+        matplotlib.rcParams["webagg.open_in_browser"] = False
+        UI_MODE = "browser"
+    except Exception:
+        matplotlib.use("Agg", force=True)
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import TwoSlopeNorm
@@ -32,8 +63,9 @@ from pathlib import Path
 from PIL import Image
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-BASE   = Path(__file__).parent / "opentraj/datasets"
-OUTPUT = Path(__file__).parent / "output"
+BASE = Path(__file__).resolve().parent.parent.parent.parent / "datasets"
+#      tools/         toolkit/  opentraj/  OpenTraj/   datasets/
+OUTPUT = Path(__file__).resolve().parent / "output"
 OUTPUT.mkdir(exist_ok=True)
 
 NS = "https://github.com/amiryanj/OpenTraj"
@@ -102,11 +134,11 @@ def rowcol_to_world(row, col, H):
 
 # ── STEP 1 — interactive goal picker ─────────────────────────────────────────
 
-def pick_goal_interactive(scene_name: str, cfg: dict,
+def pick_goal_interactive(scene_name: str, cfg: dict, on_compute,
                           init_half_w: float = 1.0,
-                          init_half_h: float = 0.5) -> tuple:
+                          init_half_h: float = 0.5) -> list:
     """
-    Open a matplotlib window showing the scene.
+    Open a matplotlib window (or browser page) showing the scene.
 
     Drawing interaction:
       First click   → anchor corner of the goal rectangle
@@ -114,16 +146,14 @@ def pick_goal_interactive(scene_name: str, cfg: dict,
       Right-click   → clear and start over
 
     Width / height sliders let you fine-tune the rectangle after placing it.
-    Closing the window confirms the goal.
+    "Compute TTR" calls on_compute(bbox) -> (out_stem, max_ttr) and keeps the
+    picker open for the next goal; "Quit" (or closing the window) ends it.
 
     Returns
     -------
-    (bbox, half_w, half_h)
-      bbox   : np.ndarray [xmin, ymin, xmax, ymax] in world metres, or None
-      half_w : final half-width  in world metres
-      half_h : final half-height in world metres
+    list of output stems that were saved (e.g. ["ETH-Univ-ttr-0", ...])
     """
-    from matplotlib.widgets import Slider
+    from matplotlib.widgets import Slider, Button
 
     H     = np.loadtxt(cfg["path"] / cfg["H"])
     H_inv = np.linalg.inv(H)
@@ -158,7 +188,7 @@ def pick_goal_interactive(scene_name: str, cfg: dict,
     ax.set_title(
         f"{scene_name}   |   "
         f"click 1 = first corner   click 2 = opposite corner   "
-        f"right-click = clear   close = compute TTR",
+        f"right-click = clear   [Compute TTR] = compute & save",
         fontsize=9)
     ax.set_xlabel("pixel col"); ax.set_ylabel("pixel row")
 
@@ -248,7 +278,7 @@ def pick_goal_interactive(scene_name: str, cfg: dict,
                 status.set_text(
                     f"Goal  ({b[0]:.2f}, {b[1]:.2f}) → ({b[2]:.2f}, {b[3]:.2f}) m"
                     f"   size {b[2]-b[0]:.2f} × {b[3]-b[1]:.2f} m"
-                    f"   —   adjust sliders or close to compute TTR")
+                    f"   —   adjust sliders, then press Compute TTR")
 
     def _clear():
         for key in ("rect_px", "dot"):
@@ -296,14 +326,110 @@ def pick_goal_interactive(scene_name: str, cfg: dict,
         _update_status()
         fig.canvas.draw_idle()
 
+    # ── buttons: "Compute TTR" (compute + save, picker stays open) and "Quit" ---
+    ax_done = fig.add_axes([0.70, 0.075, 0.16, 0.05])
+    btn_done = Button(ax_done, "Compute TTR", color="gold", hovercolor="orange")
+    ax_quit = fig.add_axes([0.70, 0.02, 0.16, 0.045])
+    btn_quit = Button(ax_quit, "Quit", color="0.85", hovercolor="0.7")
+
+    if UI_MODE == "browser":
+        import tornado.ioloop
+        from matplotlib.backends.backend_webagg import WebAggApplication
+        loop = tornado.ioloop.IOLoop.instance()   # same loop WebAgg serves on
+
+    def _mark_saved_goal(b, label):
+        """Leave a thin outline + label of a goal that has already been computed."""
+        c_tl, r_tl = w2px(b[0], b[3])
+        c_br, r_br = w2px(b[2], b[1])
+        ax.add_patch(mpatches.Rectangle(
+            (min(c_tl, c_br), min(r_tl, r_br)), abs(c_br - c_tl), abs(r_br - r_tl),
+            linewidth=1.2, edgecolor="cyan", facecolor="none", zorder=8))
+        ax.text(min(c_tl, c_br), min(r_tl, r_br) - 3, label, color="cyan",
+                fontsize=8, zorder=8, va="bottom")
+
+    def _finish(b, outcome):
+        """Runs on the UI thread once a computation has ended."""
+        state["busy"] = False
+        if isinstance(outcome, Exception):
+            status.set_text(f"Not computed: {outcome}")
+        else:
+            stem, max_ttr = outcome
+            results.append(stem)
+            _mark_saved_goal(b, stem.rsplit("-", 1)[-1])
+            status.set_text(f"Saved {stem}  (max TTR {max_ttr:.1f} s)   —   "
+                            f"pick another goal, or Quit")
+        fig.canvas.draw_idle()
+
+    def _run(b):
+        try:
+            outcome = on_compute(b)
+        except ValueError as e:     # expected problems (e.g. bad goal): message only
+            outcome = e
+        except Exception as e:      # keep the picker alive on unexpected errors
+            import traceback; traceback.print_exc()
+            outcome = e
+        if UI_MODE == "browser":
+            loop.add_callback(_finish, b, outcome)
+        else:
+            _finish(b, outcome)
+
+    def on_done(_):
+        if state["busy"]:
+            return
+        b = _bbox_world()
+        if b is None:
+            status.set_text("No goal yet — click two corners first")
+            fig.canvas.draw_idle()
+            return
+        state["busy"] = True
+        status.set_text("Computing TTR ... (progress in terminal)")
+        fig.canvas.draw_idle()
+        if UI_MODE == "browser":
+            # compute in a worker thread so the page stays responsive
+            import threading
+            threading.Thread(target=_run, args=(b,), daemon=True).start()
+        else:
+            fig.canvas.draw(); fig.canvas.flush_events()
+            _run(b)
+
+    def on_quit(_):
+        if state["busy"]:
+            status.set_text("Still computing — wait for it to finish, then Quit")
+            fig.canvas.draw_idle()
+            return
+        status.set_text("Stopped — you can close this page.")
+        fig.canvas.draw_idle()
+        if UI_MODE == "browser":
+            def _stop():
+                loop.stop()
+                WebAggApplication.started = False
+            loop.call_later(0.3, _stop)   # let the last status reach the browser
+        else:
+            plt.close(fig)
+
+    state["busy"] = False
+    results = []
+
     fig.canvas.mpl_connect("button_press_event", on_click)
     sl_w.on_changed(on_slider)
     sl_h.on_changed(on_slider)
+    btn_done.on_clicked(on_done)
+    btn_quit.on_clicked(on_quit)
 
-    plt.show()   # blocks until window is closed
+    if UI_MODE == "browser":
+        WebAggApplication.initialize()
+        print("=" * 70)
+        print(f"  Goal picker running in your browser:  "
+              f"http://127.0.0.1:{WebAggApplication.port}/")
+        print("  (VS Code Remote-SSH forwards this port automatically; otherwise use")
+        print(f"   ssh -L {WebAggApplication.port}:127.0.0.1:{WebAggApplication.port} <server>)")
+        print("  Pick a goal and press 'Compute TTR' — repeat as often as you like.")
+        print("  Press 'Quit' (or Ctrl+C here) when done.")
+        print("=" * 70, flush=True)
 
-    bbox = _bbox_world()
-    return bbox, sl_w.val, sl_h.val
+    plt.show()   # blocks until 'Quit' is pressed (or the window is closed)
+    plt.close(fig)
+    return results
 
 
 # ── STEP 2 — rasterise obstacles ─────────────────────────────────────────────
@@ -374,9 +500,10 @@ def ttr_via_odp(sdf, x_arr, y_arr, bbox, speed, resolution, epsilon=1e-4):
     from odp.solver import TTRSolver
 
     Nx, Ny = sdf.shape
-    g          = Grid(np.array([x_arr[0], y_arr[0]]),
-                      np.array([x_arr[-1], y_arr[-1]]),
-                      np.array([Nx, Ny]))
+    g          = Grid(minBounds=np.array([x_arr[0], y_arr[0]]),
+                      maxBounds=np.array([x_arr[-1], y_arr[-1]]),
+                      dims=2,
+                      pts_each_dim=np.array([Nx, Ny]))
     target_set = ShapeRectangle(g,
                                 target_min=np.array([bbox[0], bbox[1]]),
                                 target_max=np.array([bbox[2], bbox[3]]))
@@ -398,6 +525,15 @@ def _draw_goal_rect(ax, bbox, **kw):
     ax.add_patch(rect)
 
 
+def next_output_stem(scene: str) -> str:
+    """Return '<scene>-ttr-<n>' with the smallest n not already used in OUTPUT."""
+    n = 0
+    while (OUTPUT / f"{scene}-ttr-{n}.npz").exists() or \
+          (OUTPUT / f"{scene}-ttr-{n}.png").exists():
+        n += 1
+    return f"{scene}-ttr-{n}"
+
+
 def visualize_result(result: dict):
     scene  = result["scene_name"]
     ttr    = result["ttr"]
@@ -413,7 +549,11 @@ def visualize_result(result: dict):
     cx = (bbox[0] + bbox[2]) / 2
     cy = (bbox[1] + bbox[3]) / 2
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # Object-oriented Figure (not pyplot) so this can run from the picker's
+    # worker thread without opening a new window / browser figure.
+    from matplotlib.figure import Figure
+    fig  = Figure(figsize=(18, 6))
+    axes = fig.subplots(1, 3)
     fig.suptitle(
         f"{scene}  —  goal  "
         f"({bbox[0]:.2f}, {bbox[1]:.2f}) → ({bbox[2]:.2f}, {bbox[3]:.2f}) m  "
@@ -463,11 +603,10 @@ def visualize_result(result: dict):
     _draw_goal_rect(ax, bbox)
     ax.set_aspect("equal"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 
-    plt.tight_layout()
-    out_png = OUTPUT / f"{scene}_ttr.png"
-    plt.savefig(out_png, dpi=140, bbox_inches="tight")
+    fig.tight_layout()
+    out_png = OUTPUT / f"{result.get('out_stem', scene + '-ttr')}.png"
+    fig.savefig(out_png, dpi=140, bbox_inches="tight")
     print(f"Saved → {out_png}")
-    plt.show()
 
 
 # ── STEP 6 — query TTR at trajectory waypoints ───────────────────────────────
@@ -491,78 +630,117 @@ def main():
     p.add_argument("--res",     type=float, default=0.15, help="grid resolution m")
     p.add_argument("--backend", default="fmm", choices=["fmm", "odp"],
                    help="fmm = scikit-fmm (default)  |  odp = optimized_dp (needs conda)")
+    p.add_argument("--goal", type=float, nargs=4, default=None,
+                   metavar=("XMIN", "YMIN", "XMAX", "YMAX"),
+                   help="goal rectangle in world metres; skips the interactive picker "
+                        "(required when no display is available)")
     args = p.parse_args()
 
     cfg = SCENE_CFG[args.scene]
+    if args.goal is None and UI_MODE is None:
+        p.error("no display and no browser backend (install `tornado`), so the "
+                "goal picker cannot open. Pass --goal XMIN YMIN XMAX YMAX instead.")
 
-    # ── 1. pick goal interactively ────────────────────────────────────────────
-    print(f"\nOpening scene picker for {args.scene} ...")
-    print("  Click 1     = first corner of goal rectangle")
-    print("  Click 2     = opposite corner")
-    print("  Sliders     = fine-tune width / height")
-    print("  Right-click = clear and start over")
-    print("  Close window = compute TTR\n")
-    bbox, half_w, half_h = pick_goal_interactive(args.scene, cfg)
-
-    if bbox is None:
-        print("No goal selected — exiting.")
-        return
-
-    print(f"Goal bbox: ({bbox[0]:.3f}, {bbox[1]:.3f}) → ({bbox[2]:.3f}, {bbox[3]:.3f}) m  "
-          f"size {bbox[2]-bbox[0]:.2f} × {bbox[3]-bbox[1]:.2f} m")
-
-    # ── 2. build world grid ───────────────────────────────────────────────────
+    # ── 1. build world grid (goal-independent, done once) ─────────────────────
     peds    = load_trajectories(cfg)
     lines, circles = load_obstacles(cfg)
     all_pts = np.vstack(list(peds.values()))
     margin  = 1.5
     xmin, ymin = all_pts.min(0) - margin
     xmax, ymax = all_pts.max(0) + margin
+    # Also cover the whole background image, so any goal that can be clicked
+    # in the picker lies inside the TTR grid.
+    H_img = np.loadtxt(cfg["path"] / cfg["H"])
+    img_h, img_w = np.array(Image.open(cfg["path"] / cfg["bg"])).shape[:2]
+    corners = np.array([rowcol_to_world(r, c, H_img)
+                        for r in (0, img_h - 1) for c in (0, img_w - 1)])
+    xmin, ymin = np.minimum([xmin, ymin], corners.min(0))
+    xmax, ymax = np.maximum([xmax, ymax], corners.max(0))
 
     print(f"World bounds: x=[{xmin:.2f},{xmax:.2f}]  y=[{ymin:.2f},{ymax:.2f}]")
 
-    # ── 3. occupancy grid ─────────────────────────────────────────────────────
+    # ── 2. occupancy grid ─────────────────────────────────────────────────────
     print("Rasterising obstacles ...")
     obs_grid, x_arr, y_arr = rasterize_obstacles(
         lines, circles, (xmin, xmax), (ymin, ymax), args.res)
     print(f"  Grid: {obs_grid.shape}  obstacle cells: {obs_grid.sum()}")
 
-    # ── 4. SDF ────────────────────────────────────────────────────────────────
+    # ── 3. SDF ────────────────────────────────────────────────────────────────
     print("Computing SDF ...")
     sdf = compute_sdf(obs_grid, args.res)
     print(f"  SDF range: [{sdf.min():.2f}, {sdf.max():.2f}] m")
 
-    # ── 5. TTR ────────────────────────────────────────────────────────────────
-    print(f"Computing TTR via '{args.backend}' ...")
-    if args.backend == "fmm":
-        ttr = ttr_via_fmm(sdf, x_arr, y_arr, bbox, args.speed, args.res)
-    else:
-        ttr = ttr_via_odp(sdf, x_arr, y_arr, bbox, args.speed, args.res)
-    finite = ttr[np.isfinite(ttr)]
-    print(f"  Done — max TTR: {finite.max():.2f} s  reachable cells: {len(finite)}")
+    def compute_and_save(bbox):
+        """TTR for one goal → saved as <scene>-ttr-<n>.npz/.png. Returns (stem, max TTR)."""
+        bbox = np.asarray(bbox, dtype=float)
+        print(f"\nGoal bbox: ({bbox[0]:.3f}, {bbox[1]:.3f}) → "
+              f"({bbox[2]:.3f}, {bbox[3]:.3f}) m  "
+              f"size {bbox[2]-bbox[0]:.2f} × {bbox[3]-bbox[1]:.2f} m")
 
-    result = dict(
-        ttr=ttr, sdf=sdf, obs_grid=obs_grid, obs_lines=lines,
-        x_arr=x_arr, y_arr=y_arr, trajectories=peds,
-        scene_name=args.scene, bbox=bbox,
-    )
+        # goal must cover at least one free grid cell, otherwise TTR is empty
+        in_x = (x_arr >= bbox[0]) & (x_arr <= bbox[2])
+        in_y = (y_arr >= bbox[1]) & (y_arr <= bbox[3])
+        if not (sdf[np.ix_(in_x, in_y)] > 0).any():
+            print("  Skipped: goal covers no free grid cell — it is outside the "
+                  f"computed area (x=[{x_arr[0]:.1f},{x_arr[-1]:.1f}], "
+                  f"y=[{y_arr[0]:.1f},{y_arr[-1]:.1f}] m), inside an obstacle, "
+                  "or smaller than --res.")
+            raise ValueError("goal covers no free cell (outside area / in obstacle)"
+                             " — pick another goal")
 
-    # ── 6. save arrays ────────────────────────────────────────────────────────
-    out_npz = OUTPUT / f"{args.scene}_ttr.npz"
-    np.savez(out_npz, ttr=ttr, sdf=sdf, x_arr=x_arr, y_arr=y_arr, bbox=bbox)
-    print(f"Arrays saved → {out_npz}")
+        # ── 4. TTR ────────────────────────────────────────────────────────────
+        print(f"Computing TTR via '{args.backend}' ...")
+        if args.backend == "fmm":
+            ttr = ttr_via_fmm(sdf, x_arr, y_arr, bbox, args.speed, args.res)
+        else:
+            ttr = ttr_via_odp(sdf, x_arr, y_arr, bbox, args.speed, args.res)
+        finite = ttr[np.isfinite(ttr)]
+        if finite.size == 0:
+            print("  Skipped: the solver found no reachable cell for this goal.")
+            raise ValueError("no cell can reach this goal — pick another goal")
+        print(f"  Done — max TTR: {finite.max():.2f} s  reachable cells: {len(finite)}")
 
-    # ── 7. show result + query ────────────────────────────────────────────────
-    visualize_result(result)
+        # ── 5. save: each run gets the next free number <scene>-ttr-<n> ───────
+        out_stem = next_output_stem(args.scene)
+        result = dict(
+            ttr=ttr, sdf=sdf, obs_grid=obs_grid, obs_lines=lines,
+            x_arr=x_arr, y_arr=y_arr, trajectories=peds,
+            scene_name=args.scene, bbox=bbox, out_stem=out_stem,
+        )
+        out_npz = OUTPUT / f"{out_stem}.npz"
+        np.savez(out_npz, ttr=ttr, sdf=sdf, x_arr=x_arr, y_arr=y_arr, bbox=bbox,
+                 speed=args.speed, res=args.res, backend=args.backend)
+        print(f"Arrays saved → {out_npz}")
+        visualize_result(result)
 
-    ttr_trajs = query_ttr(result)
-    print("\n── TTR at start / end of first 5 pedestrian trajectories ──")
-    for pid, vals in list(ttr_trajs.items())[:5]:
-        finite = vals[np.isfinite(vals)]
-        if len(finite):
-            print(f"  Ped {pid:5d}:  "
-                  f"start={vals[0]:.2f}s  end={vals[-1]:.2f}s  "
-                  f"mean={finite.mean():.2f}s")
+        # ── 6. query TTR along trajectories ───────────────────────────────────
+        ttr_trajs = query_ttr(result)
+        print("── TTR at start / end of first 5 pedestrian trajectories ──")
+        for pid, vals in list(ttr_trajs.items())[:5]:
+            fin = vals[np.isfinite(vals)]
+            if len(fin):
+                print(f"  Ped {pid:5d}:  "
+                      f"start={vals[0]:.2f}s  end={vals[-1]:.2f}s  "
+                      f"mean={fin.mean():.2f}s")
+        return out_stem, float(finite.max())
+
+    # ── 7. goal from CLI (one run) or interactive picker (many runs) ──────────
+    if args.goal is not None:
+        gx0, gy0, gx1, gy1 = args.goal
+        compute_and_save([min(gx0, gx1), min(gy0, gy1),
+                          max(gx0, gx1), max(gy0, gy1)])
+        return
+
+    print(f"\nOpening scene picker for {args.scene} ...")
+    print("  Click 1     = first corner of goal rectangle")
+    print("  Click 2     = opposite corner")
+    print("  Sliders     = fine-tune width / height")
+    print("  Right-click = clear and start over")
+    print("  Compute TTR = compute & save this goal (picker stays open)")
+    print("  Quit        = exit\n")
+    saved = pick_goal_interactive(args.scene, cfg, compute_and_save)
+    print(f"\nFinished. {len(saved)} TTR result(s) saved in {OUTPUT}: "
+          f"{', '.join(saved) if saved else '-'}")
 
 
 if __name__ == "__main__":
